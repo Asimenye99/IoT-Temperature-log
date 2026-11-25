@@ -1,0 +1,11 @@
+id,measure_name,unit,technology
+8,current,Ampere,current shunt
+5,power,Watt,current shunt and voltage tap
+6,power,Watt,current transformer and voltage tap
+0,temperature,Celsius,unknown
+7,current,Ampere,split-core current transformer (0.333V @ 30A)
+1,temperature,Celsius,k-type thermocouple
+2,temperature,Fahrenheit,k-type thermocouple
+3,temperature,Celsius,thermistor
+4,temperature,Fahrenheit,thermistor
+9,temperature,Celsius,internal case temperature

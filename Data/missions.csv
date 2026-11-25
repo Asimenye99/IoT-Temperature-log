@@ -1,0 +1,7 @@
+mission_id,mission_name,meter_name,device_id,sample_interval,start_time,stop_time,notes,campaign,creator_username,organization_name,metric_count,last_metric_at,last_data_transfer_at
+4bb5a8cb-83fc-40b0-92d5-cd1f149f828d,36B82C-N8DN7TG,,F06DE6BBFE36B82C,60,2026-09-09 14:09:19.706+00,,,,isaiahchisenga,irisecarbon private,18418,2026-09-22 09:06:49+00,2026-09-22 09:06:51.398+00
+4db0ca08-3931-4c42-a359-ef57df267f54,D29D88-N8Q09CQZ,,2997E6920ED29D88,60,2026-06-11 08:43:00.007+00,2026-06-11 09:32:53.002+00,,,wakie27,irisecarbon private,50,2026-06-11 09:32:30+00,2026-09-09 13:17:22.764+00
+ae6d20c7-fc4e-4b89-82a0-a3985e53611c,B1A4D0-VC0Q2QHN,,C82BE91F6EB1A4D0,60,2026-09-09 14:47:36.402+00,,,,isaiahchisenga,irisecarbon private,18520,2026-09-22 11:27:06+00,2026-09-22 11:26:47.138+00
+e73ca77d-8378-434e-b70c-14232908a87e,D29D88-002,,2997E6920ED29D88,60,2026-09-09 13:17:25.638+00,,,,isaiahchisenga,irisecarbon private,18489,2026-09-22 09:25:55+00,2026-09-22 09:25:51.631+00
+ecbd51d5-d5ed-400b-b3d3-40ff10a64e31,852BBD-T7A4TPR1,,279C748376852BBD,60,2026-09-09 10:40:56.863+00,,,,isaiahchisenga,irisecarbon private,18597,2026-09-22 08:37:26+00,2026-09-22 08:37:51.949+00
+f9f03b56-88c6-4635-b8b8-435c1451a933,B45D17-DP04BSTR,,BB0311DB25B45D17,60,2026-09-09 14:00:11.075+00,,,,isaiahchisenga,irisecarbon private,18444,2026-09-22 09:23:41+00,2026-09-22 09:23:24.26+00

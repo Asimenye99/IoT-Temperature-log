@@ -1,0 +1,605 @@
+---
+title: "Kasungu Cooking Events – Temperature, Timing and Duration"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+params:
+  data_dir: "."               # "." = the same folder as this Rmd. Or give a path to the data folder.
+  tz: "Africa/Blantyre"       # Kasungu, Malawi local time (CAT, UTC+2)
+  stove_sensor: 1             # sensor_type_id 1 = k-type thermocouple (Celsius) -> stove/fire temperature
+  case_sensor: 9              # sensor_type_id 9 = internal case temperature (Celsius) -> ambient reference
+  exclude_partial_days: true  # ignore first/last (partial) day when ranking highest/lowest days
+  plots_dir: "plots"          # every figure is saved here as a PNG (created next to this Rmd)
+  day_free_y: false           # true = each household row gets its own temperature scale (peaks fill each row)
+---
+
+```{r setup, include=FALSE}
+# EVERY plot chunk ends with save_chunk_plot("<chunk name>"), which saves that chunk's plot as a PNG
+# in `plots_dir` (e.g. plots/overall-daily.png). The one-per-day plots are also saved by date in
+# plots/days/ (e.g. plots/days/day_2026-09-10.png). Multi-panel plots are ALSO saved one
+# household at a time in plots/by_household/<Household>/ (each panel on its own).
+plots_dir <- params$plots_dir
+dir.create(file.path(plots_dir, "days"), recursive = TRUE, showWarnings = FALSE)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 12, fig.height = 5, dpi = 150)
+
+# Saves ONE image per household from a multi-panel plot (each panel on its own):
+#   plots/by_household/<Household>/<subdir>/<name>.png
+save_by_person <- function(p, name, width, height, subdir = "") {
+  for (pp in persons) {
+    out_dir <- file.path(plots_dir, "by_household", gsub("[^A-Za-z0-9]+", "_", pp), subdir)
+    dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+    tryCatch({
+      keep <- function(d) {
+        if (is.data.frame(d) && "person" %in% names(d)) d[as.character(d$person) == pp, , drop = FALSE] else d
+      }
+      q <- p
+      q$data   <- keep(p$data)
+      q$layers <- lapply(p$layers, function(l) {
+        if (is.data.frame(l$data)) ggplot2::ggproto(NULL, l, data = keep(l$data)) else l
+      })
+      q <- q + ggplot2::facet_null() +
+        ggplot2::labs(title = paste0(p$labels$title, " \u2013 ", pp))
+      ggplot2::ggsave(file.path(out_dir, paste0(name, ".png")), q,
+                      width = width, height = max(3.5, height / length(persons) * 1.5), dpi = 150)
+    }, error = function(e) message("Could not save panel for ", pp, " (", name, "): ", conditionMessage(e)))
+  }
+}
+
+# Helper used at the end of every plot chunk: saves that chunk's plot as plots/<name>.png
+save_chunk_plot <- function(name, height = 5, width = 12) {
+  ggplot2::ggsave(file.path(plots_dir, paste0(name, ".png")), plot = ggplot2::last_plot(),
+                  width = width, height = height, dpi = 150)
+}
+install.packages(c("tidyverse", "lubridate", "scales", "jsonlite"))  # run once if needed
+library(tidyverse)
+library(lubridate)
+library(scales)
+
+theme_set(theme_minimal(base_size = 12) +
+            theme(panel.grid.minor = element_blank(),
+                  strip.text = element_text(face = "bold", hjust = 0)))
+hour_labels <- function(x) sprintf("%02d:00", x)
+```
+
+# 0. Data preparation
+
+* **Events** (`events.csv`) give the start and stop time of every cooking event.
+* **Household names** come from `tags.csv` (linked by `mission_id`).
+* **Temperatures** come from the `*_json.gz` files: one reading per minute from the stove
+  thermocouple (**stove**, °C) and from the device case (**case**, °C, used as an ambient reference).
+* Each event is matched to the stove readings taken between its start and stop time to get its
+  **peak**, **mean** and **starting** temperature.
+* All times are converted from UTC to Kasungu local time.
+
+```{r prep}
+# ---- Locate the data folder -------------------------------------------------
+# "." means the folder this Rmd is saved in. If the folder given in the header does not
+# hold events.csv, fall back to the Rmd's own folder.
+data_dir <- params$data_dir
+if (!file.exists(file.path(data_dir, "events.csv"))) data_dir <- "."
+if (!file.exists(file.path(data_dir, "events.csv"))) {
+  stop("events.csv not found. Looked in: ", normalizePath(data_dir),
+       "\nFiles there: ", paste(list.files(data_dir), collapse = ", "))
+}
+
+events_raw <- read_csv(file.path(data_dir, "events.csv"), show_col_types = FALSE) %>%
+  filter(!is.na(start_time), event_kind == "cooking")
+tags     <- read_csv(file.path(data_dir, "tags.csv"),     show_col_types = FALSE)
+missions <- read_csv(file.path(data_dir, "missions.csv"), show_col_types = FALSE)
+
+# ---- Household names -------------------------------------------------------
+# Names come from tags.csv. A mission with no tag is labelled "Unassigned (<mission name>)".
+# To name another one yourself, add:  "<mission_id>" = "Household Name"  to the vector below.
+manual_names <- c("e73ca77d-8378-434e-b70c-14232908a87e" = "Julius Nyirenda")   # device D29D88-002
+
+mission_lookup <- missions %>%
+  select(mission_id, mission_name, device_id) %>%
+  left_join(tags, by = "mission_id") %>%
+  mutate(person = coalesce(unname(manual_names[mission_id]),
+                           str_to_title(tag),
+                           paste0("Unassigned (", mission_name, ")")))
+
+# ---- Temperature readings --------------------------------------------------
+# Accepts *_json.gz, *.json.gz, or already-unzipped *_json / *.json (some browsers unzip downloads)
+temp_files <- list.files(data_dir, pattern = "json(\\.gz)?$", full.names = TRUE,
+                         recursive = TRUE, ignore.case = TRUE)
+if (length(temp_files) == 0) {
+  stop("No temperature (json) files found in: ", normalizePath(data_dir),
+       "\nFiles there: ", paste(list.files(data_dir, recursive = TRUE), collapse = ", "))
+}
+cat("Temperature files found:", length(temp_files), "\n")
+
+temps_raw <- map_dfr(temp_files, function(f) as_tibble(jsonlite::fromJSON(gzfile(f))))
+
+temps <- temps_raw %>%
+  filter(mission_id %in% events_raw$mission_id,
+         sensor_type_id %in% c(params$stove_sensor, params$case_sensor)) %>%
+  mutate(time   = floor_date(with_tz(as_datetime(timestamp / 1000, tz = "UTC"), params$tz), "second"),
+         sensor = if_else(sensor_type_id == params$stove_sensor, "stove", "case")) %>%
+  select(mission_id, time, sensor, value) %>%
+  pivot_wider(names_from = sensor, values_from = value) %>%
+  left_join(select(mission_lookup, mission_id, person), by = "mission_id") %>%
+  mutate(date = as_date(time), hr = hour(time) + minute(time) / 60)
+
+# ---- Events ----------------------------------------------------------------
+ev <- events_raw %>%
+  left_join(select(mission_lookup, mission_id, person), by = "mission_id") %>%
+  mutate(
+    event_id     = row_number(),
+    start_local  = with_tz(ymd_hms(start_time, tz = "UTC"), params$tz),
+    stop_local   = with_tz(ymd_hms(stop_time,  tz = "UTC"), params$tz),
+    date         = as_date(start_local),
+    stop_date    = as_date(stop_local),
+    start_hr     = hour(start_local) + minute(start_local) / 60,
+    stop_hr      = hour(stop_local)  + minute(stop_local)  / 60,
+    duration_min = as.numeric(difftime(stop_local, start_local, units = "mins"))
+  )
+
+# Match every event to the stove readings taken while it was running
+temps_by <- split(temps, temps$mission_id)
+ev_stats <- map_dfr(seq_len(nrow(ev)), function(i) {
+  x <- temps_by[[ev$mission_id[i]]]
+  w <- x[!is.na(x$stove) & x$time >= ev$start_local[i] & x$time <= ev$stop_local[i], ]
+  if (nrow(w) == 0) {
+    return(tibble(peak_temp = NA_real_, peak_time = as.POSIXct(NA, tz = params$tz),
+                  mean_temp = NA_real_, start_temp = NA_real_, case_temp = NA_real_))
+  }
+  j <- which.max(w$stove)
+  tibble(peak_temp = w$stove[j], peak_time = w$time[j], mean_temp = mean(w$stove),
+         start_temp = w$stove[1], case_temp = mean(w$case, na.rm = TRUE))
+})
+
+ev <- bind_cols(ev, ev_stats) %>%
+  mutate(temp = peak_temp,                       # "temp" = peak stove temperature of the event
+         rise = peak_temp - start_temp,
+         peak_hr = hour(peak_time) + minute(peak_time) / 60)
+
+has_temp <- any(!is.na(ev$temp))
+
+all_days      <- seq(min(ev$date), max(ev$date), by = "day")
+n_days        <- length(all_days)
+partial_days  <- unique(c(min(ev$date), max(ev$date)))
+complete_days <- setdiff(all_days, partial_days) %>% as_date()
+avg_days      <- if (params$exclude_partial_days && length(complete_days) > 0) complete_days else all_days
+persons       <- sort(unique(ev$person))
+day_h         <- 2.4 * length(persons) + 1.5   # height (inches) of the one-day plots: grows with households
+person_cols   <- setNames(scales::brewer_pal(palette = "Dark2")(max(3, length(persons)))[seq_along(persons)], persons)
+
+# Segments: one row per event per calendar day (splits events crossing midnight)
+seg <- bind_rows(
+  ev %>% transmute(person, date, x0 = start_hr,
+                   x1 = if_else(stop_date > date, 24, stop_hr),
+                   label = format(start_local, "%H:%M"),
+                   span_label = paste0(format(start_local, "%H:%M"), "-", format(stop_local, "%H:%M")),
+                   temp, duration_min),
+  ev %>% filter(stop_date > date) %>%
+    transmute(person, date = stop_date, x0 = 0, x1 = stop_hr,
+              label = "", span_label = paste0("...-", format(stop_local, "%H:%M")),
+              temp, duration_min)
+) %>% mutate(dur_h = x1 - x0)
+
+x_lo <- max(0,  floor(min(seg$x0)) - 1)
+x_hi <- min(24, ceiling(max(seg$x1)) + 1)
+
+cat("Events:", nrow(ev), "| Households:", length(persons),
+    "| Period:", format(min(ev$date)), "to", format(max(ev$date)),
+    "| Events matched to temperature:", sum(!is.na(ev$peak_temp)), "of", nrow(ev), "\n")
+```
+
+```{r unassigned-note, results='asis', echo=FALSE}
+un <- persons[str_detect(persons, "^Unassigned")]
+if (length(un) > 0) {
+  cat("> **Note:** mission `", paste(un, collapse = "`, `"), "` has no household name in `tags.csv`. ",
+      "It is shown as *Unassigned*. To give it a name, add it to `manual_names` in the chunk above.\n", sep = "")
+}
+```
+
+```{r data-check}
+ev %>% group_by(Household = person, mission_id) %>%
+  summarise(Events = n(),
+            `Events with temperature` = sum(!is.na(peak_temp)),
+            `Lowest event peak (°C)`  = min(peak_temp, na.rm = TRUE),
+            `Highest event peak (°C)` = max(peak_temp, na.rm = TRUE), .groups = "drop") %>%
+  left_join(select(missions, mission_id, `Device` = device_id), by = "mission_id") %>%
+  select(-mission_id)
+```
+
+```{r day-plot-fn}
+# Draws ONE day: a row per household with the stove temperature trace (solid), the device case
+# temperature (dashed), the cooking events shaded from start to stop, and each event's peak.
+day_plot <- function(d, prefix = "") {
+  tp <- temps %>% filter(date == d) %>% mutate(person = factor(person, levels = persons))
+  ds <- seg   %>% filter(date == d) %>%
+    mutate(person = factor(person, levels = persons), xmax = pmax(x1, x0 + 0.1))
+  pk <- ev    %>% filter(date == d, !is.na(peak_temp), as_date(peak_time) == d) %>%
+    mutate(person = factor(person, levels = persons))
+
+  ggplot() +
+    geom_rect(data = ds, aes(xmin = x0, xmax = xmax, ymin = -Inf, ymax = Inf, fill = person),
+              alpha = 0.18, inherit.aes = FALSE) +
+    geom_line(data = tp, aes(hr, case), colour = "grey55", linetype = "dashed", linewidth = 0.5) +
+    geom_line(data = tp, aes(hr, stove, colour = person), linewidth = 0.9) +
+    geom_point(data = pk, aes(peak_hr, peak_temp, colour = person), size = 2) +
+    geom_text(data = pk, aes(peak_hr, peak_temp, label = round(peak_temp, 0)),
+              vjust = -0.8, size = 2.8) +
+    geom_text(data = ds, aes(x0, y = -Inf, label = span_label),
+              angle = 90, hjust = 0, vjust = -0.4, size = 2.3, colour = "grey25") +
+    facet_grid(rows = vars(person), scales = if (isTRUE(params$day_free_y)) "free_y" else "fixed") +
+    scale_colour_manual(values = person_cols, guide = "none") +
+    scale_fill_manual(values = person_cols, guide = "none") +
+    scale_x_continuous(breaks = seq(x_lo, x_hi, 1), minor_breaks = seq(x_lo, x_hi, 0.5),
+                       labels = hour_labels) +
+    scale_y_continuous(expand = expansion(mult = c(0.02, 0.3))) +   # extra headroom so peaks and their labels are not cut off
+    coord_cartesian(xlim = c(x_lo, x_hi), expand = FALSE) +
+    labs(title = paste0(prefix, format(d, "%A %d %B %Y"), " – ", nrow(ds), " events, ",
+                        round(sum(ds$dur_h), 1), " h of cooking"),
+         subtitle = paste("Solid line = stove temperature, dashed = device case temperature.",
+                          "Shaded = cooking event (start to stop, rotated label).",
+                          "Number = peak temperature (°C)."),
+         x = "Time of day (Kasungu local)", y = "Temperature (°C)") +
+    theme(panel.grid.minor.x = element_line(colour = "grey90"),
+          panel.grid.major.x = element_line(colour = "grey75"),
+          strip.text.y = element_text(angle = 0, hjust = 0, face = "bold"),
+          panel.spacing.y = unit(0.6, "lines"))
+}
+```
+
+---
+
+# 1. Overall (all households)
+
+## 1.1 Cooking events per day
+
+Lighter bars are partial days (data starts/stops part-way through the day).
+
+```{r overall-daily}
+day_tot <- ev %>% count(date, name = "n_events") %>%
+  complete(date = all_days, fill = list(n_events = 0)) %>%
+  mutate(partial = date %in% partial_days)
+
+ggplot(day_tot, aes(date, n_events, alpha = partial)) +
+  geom_col(fill = "#1B9E77", width = 0.75) +
+  geom_text(aes(label = n_events), vjust = -0.4, size = 3.5, show.legend = FALSE) +
+  geom_hline(yintercept = mean(day_tot$n_events[!day_tot$partial]),
+             linetype = "dashed", colour = "grey30") +
+  scale_alpha_manual(values = c(`FALSE` = 1, `TRUE` = 0.45), guide = "none") +
+  scale_x_date(date_breaks = "1 day", date_labels = "%a %d %b") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(title = "Cooking events per day – all households",
+       subtitle = "Dashed line = mean of complete days", x = NULL, y = "Events per day") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.grid.major.x = element_blank())
+
+save_chunk_plot("overall-daily")
+```
+
+## 1.2 Time and temperature of every event
+
+Each dot is one event at its start time of day. Colour = peak stove temperature (°C); size = duration.
+
+```{r overall-times, fig.height=6}
+ggplot(ev, aes(date, start_hr, size = duration_min, colour = peak_temp)) +
+  geom_point(alpha = 0.85, position = position_jitter(width = 0.15, height = 0, seed = 1)) +
+  scale_colour_viridis_c(option = "inferno", end = 0.9, name = "Peak temp (°C)") +
+  scale_size_continuous(name = "Duration (min)", range = c(1.5, 7)) +
+  scale_x_date(date_breaks = "1 day", date_labels = "%a %d %b") +
+  scale_y_continuous(limits = c(0, 24), breaks = seq(0, 24, 3), labels = hour_labels) +
+  labs(title = "Start time of every cooking event", x = NULL, y = "Time of day") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+save_chunk_plot("overall-times", height = 6)
+```
+
+## 1.3 Peak temperature of events, per day
+
+Line = mean event peak temperature; band = coolest to hottest event peak that day.
+
+```{r overall-temp, eval=has_temp}
+ev %>% group_by(date) %>%
+  summarise(mean_peak = mean(peak_temp, na.rm = TRUE), max_peak = max(peak_temp, na.rm = TRUE),
+            min_peak = min(peak_temp, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(date)) +
+  geom_ribbon(aes(ymin = min_peak, ymax = max_peak), fill = "#E76F51", alpha = 0.25) +
+  geom_line(aes(y = mean_peak), colour = "#B33A1F", linewidth = 1) +
+  geom_point(aes(y = mean_peak), colour = "#B33A1F") +
+  scale_x_date(date_breaks = "1 day", date_labels = "%a %d %b") +
+  labs(title = "Peak temperature of cooking events per day (mean line, min–max band)",
+       x = NULL, y = "Peak stove temperature (°C)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+save_chunk_plot("overall-temp")
+```
+
+## 1.4 The average day: events per hour
+
+Line = average day; band = quietest to busiest day (all households combined, complete days only).
+
+```{r overall-profile}
+grid <- expand_grid(person = persons, date = all_days, hr = 0:23)
+
+hourly_pd <- ev %>% mutate(hr = hour(start_local)) %>%
+  count(person, date, hr, name = "n") %>%
+  right_join(grid, by = c("person", "date", "hr")) %>%
+  mutate(n = replace_na(n, 0))
+
+overall_hr <- hourly_pd %>% filter(date %in% avg_days) %>%
+  group_by(date, hr) %>% summarise(n = sum(n), .groups = "drop") %>%
+  group_by(hr) %>% summarise(mean_n = mean(n), lo = min(n), hi = max(n), .groups = "drop")
+
+ggplot(overall_hr, aes(hr, mean_n)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), fill = "#F4A261", alpha = 0.3) +
+  geom_line(colour = "#D95F02", linewidth = 1) + geom_point(colour = "#D95F02") +
+  scale_x_continuous(breaks = seq(0, 23, 2), labels = hour_labels) +
+  labs(title = "Average day: cooking events per hour – all households",
+       x = "Hour of day", y = "Events per hour")
+
+save_chunk_plot("overall-profile")
+```
+
+## 1.5 The average day: stove temperature by hour, per household
+
+```{r overall-temp-profile}
+temps %>% filter(date %in% avg_days) %>%
+  mutate(hr_int = hour(time)) %>%
+  group_by(person, hr_int) %>% summarise(stove = mean(stove, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(hr_int, stove, colour = person)) +
+  geom_line(linewidth = 1) + geom_point() +
+  scale_colour_manual(values = person_cols, name = "Household") +
+  scale_x_continuous(breaks = seq(0, 23, 2), labels = hour_labels) +
+  labs(title = "Average stove temperature through the day", 
+       subtitle = "Mean of all minute readings in each hour, complete days only",
+       x = "Hour of day", y = "Stove temperature (°C)") +
+  theme(legend.position = "bottom")
+
+save_chunk_plot("overall-temp-profile")
+```
+
+## 1.6 Cooking events per hour over the whole period
+
+```{r overall-series}
+hourly_all <- ev %>% count(hour_start = floor_date(start_local, "hour"), name = "n") %>%
+  complete(hour_start = seq(min(hour_start), max(hour_start), by = "hour"), fill = list(n = 0))
+
+ggplot(hourly_all, aes(hour_start, n)) +
+  geom_area(fill = "#F4A261", alpha = 0.35) + geom_line(colour = "#D95F02", linewidth = 0.5) +
+  scale_x_datetime(date_breaks = "1 day", date_labels = "%a %d %b", timezone = params$tz) +
+  labs(title = "Cooking events per hour over the whole period", x = NULL, y = "Events per hour") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+save_chunk_plot("overall-series")
+```
+
+## 1.7 Total cooking duration per day
+
+```{r overall-duration}
+dur_day <- seg %>% group_by(person, date) %>% summarise(hours = sum(dur_h), .groups = "drop") %>%
+  complete(person, date = all_days, fill = list(hours = 0))
+dur_tot <- dur_day %>% group_by(date) %>% summarise(hours = sum(hours), .groups = "drop")
+
+ggplot(dur_day, aes(date, hours, fill = person)) +
+  geom_col(width = 0.75) +
+  geom_text(data = dur_tot, aes(y = hours, label = round(hours, 1), fill = NULL),
+            vjust = -0.4, size = 3.5) +
+  scale_fill_manual(values = person_cols, name = "Household") +
+  scale_x_date(date_breaks = "1 day", date_labels = "%a %d %b") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(title = "Total cooking time per day (hours) – stacked by household",
+       x = NULL, y = "Hours of cooking") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "bottom",
+        panel.grid.major.x = element_blank())
+
+save_chunk_plot("overall-duration")
+```
+
+---
+
+# 2. Detailed – per household
+
+## 2.1 Cooking events per day
+
+```{r person-daily, fig.height=10, by_person=TRUE}
+day_person <- ev %>% count(person, date, name = "n_events") %>%
+  complete(person, date = all_days, fill = list(n_events = 0))
+
+ggplot(day_person, aes(date, n_events, fill = person)) +
+  geom_col(width = 0.75, show.legend = FALSE) +
+  geom_text(aes(label = n_events), vjust = -0.4, size = 3) +
+  facet_wrap(~ person, ncol = 1) +
+  scale_fill_manual(values = person_cols) +
+  scale_x_date(date_breaks = "1 day", date_labels = "%a %d %b") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.2))) +
+  labs(title = "Cooking events per day, per household", x = NULL, y = "Events per day") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.grid.major.x = element_blank())
+
+save_chunk_plot("person-daily", height = 10)
+```
+
+## 2.2 Events per hour of day, with peak hours and temperatures
+
+Thin lines = each individual day. Thick line = average of complete days. The three busiest
+hours are labelled with the time and the mean peak temperature of the events starting in that hour.
+
+```{r person-profile, fig.height=10, by_person=TRUE}
+avg_person <- hourly_pd %>% filter(date %in% avg_days) %>%
+  group_by(person, hr) %>% summarise(mean_n = mean(n), .groups = "drop")
+
+temp_pp <- ev %>% mutate(hr = hour(start_local)) %>%
+  group_by(person, hr) %>% summarise(mean_temp = mean(peak_temp, na.rm = TRUE), .groups = "drop") %>%
+  mutate(mean_temp = ifelse(is.nan(mean_temp), NA_real_, mean_temp))
+
+peaks <- avg_person %>% left_join(temp_pp, by = c("person", "hr")) %>%
+  group_by(person) %>% slice_max(mean_n, n = 3, with_ties = FALSE) %>% ungroup() %>%
+  mutate(peak_lab = paste0(hour_labels(hr), "\n", round(mean_temp, 0), " °C"))
+
+ggplot() +
+  geom_line(data = hourly_pd, aes(hr, n, group = date), colour = "grey60", alpha = 0.35, linewidth = 0.3) +
+  geom_line(data = avg_person, aes(hr, mean_n, colour = person), linewidth = 1.3, show.legend = FALSE) +
+  geom_point(data = peaks, aes(hr, mean_n, colour = person), size = 3, show.legend = FALSE) +
+  geom_label(data = peaks, aes(hr, mean_n, label = peak_lab, colour = person),
+             vjust = -0.3, size = 3, label.size = 0, fill = alpha("white", 0.8), show.legend = FALSE) +
+  facet_wrap(~ person, ncol = 1) +
+  scale_colour_manual(values = person_cols) +
+  scale_x_continuous(breaks = seq(0, 23, 2), labels = hour_labels) +
+  scale_y_continuous(breaks = pretty_breaks(), expand = expansion(mult = c(0.02, 0.4))) +
+  labs(title = "Events per hour of day, per household (each day + average)",
+       subtitle = "Labels on the three busiest hours: time and mean peak temperature",
+       x = "Hour of day", y = "Events per hour")
+
+save_chunk_plot("person-profile", height = 10)
+```
+
+## 2.3 Stove temperature over the whole period, per household
+
+The line is the stove temperature every minute; the highs are the cooking events and the lows
+are the gaps between them. Shaded bands mark each recorded cooking event.
+
+```{r person-temp-series, fig.height=11, by_person=TRUE}
+events_shade <- ev %>% select(person, start_local, stop_local)
+
+ggplot() +
+  geom_rect(data = events_shade,
+            aes(xmin = start_local, xmax = stop_local, ymin = -Inf, ymax = Inf, fill = person),
+            alpha = 0.25) +
+  geom_line(data = temps, aes(time, stove, colour = person), linewidth = 0.3) +
+  facet_wrap(~ person, ncol = 1) +
+  scale_colour_manual(values = person_cols, guide = "none") +
+  scale_fill_manual(values = person_cols, guide = "none") +
+  scale_x_datetime(date_breaks = "1 day", date_labels = "%a %d %b", timezone = params$tz) +
+  labs(title = "Stove temperature through the whole period, per household",
+       subtitle = "Shaded = recorded cooking events", x = NULL, y = "Stove temperature (°C)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+save_chunk_plot("person-temp-series", height = 11)
+```
+
+## 2.4 Peak temperature of each event, per household
+
+```{r person-peak-dist}
+ggplot(filter(ev, !is.na(peak_temp)), aes(reorder(person, peak_temp, median), peak_temp, colour = person)) +
+  geom_boxplot(outlier.shape = NA, fill = NA, linewidth = 0.6) +
+  geom_jitter(width = 0.15, alpha = 0.55, size = 1.6) +
+  coord_flip() +
+  scale_colour_manual(values = person_cols, guide = "none") +
+  labs(title = "Peak stove temperature of each cooking event",
+       subtitle = "Box = middle 50% of events; dots = individual events", x = NULL, y = "Peak temperature (°C)")
+
+save_chunk_plot("person-peak-dist")
+```
+
+## 2.5 Total cooking duration per day
+
+```{r person-duration, fig.height=10, by_person=TRUE}
+ggplot(dur_day, aes(date, hours, fill = person)) +
+  geom_col(width = 0.75, show.legend = FALSE) +
+  geom_text(aes(label = ifelse(hours > 0, round(hours, 1), "")), vjust = -0.4, size = 3) +
+  facet_wrap(~ person, ncol = 1) +
+  scale_fill_manual(values = person_cols) +
+  scale_x_date(date_breaks = "1 day", date_labels = "%a %d %b") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.2))) +
+  labs(title = "Total cooking time per day (hours), per household", x = NULL, y = "Hours of cooking") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.grid.major.x = element_blank())
+
+save_chunk_plot("person-duration", height = 10)
+```
+
+---
+
+# 3. Highest and lowest days
+
+Days are ranked by number of cooking events (complete days only; see `exclude_partial_days`).
+
+```{r hi-lo, fig.height=day_h}
+rank_days <- day_tot %>% filter(date %in% avg_days)
+hi_day <- rank_days$date[which.max(rank_days$n_events)]
+lo_day <- rank_days$date[which.min(rank_days$n_events)]
+
+p_hi <- day_plot(hi_day, paste0("HIGHEST (", max(rank_days$n_events), " events): "))
+p_lo <- day_plot(lo_day, paste0("LOWEST (",  min(rank_days$n_events), " events): "))
+print(p_hi)
+print(p_lo)
+ggsave(file.path(plots_dir, "days", paste0("highest_day_", format(hi_day), ".png")), p_hi, width = 12, height = day_h, dpi = 150)
+ggsave(file.path(plots_dir, "days", paste0("lowest_day_",  format(lo_day), ".png")), p_lo, width = 12, height = day_h, dpi = 150)
+save_by_person(p_hi, paste0("highest_day_", format(hi_day)), 12, 9, "days")
+save_by_person(p_lo, paste0("lowest_day_",  format(lo_day)), 12, 9, "days")
+```
+
+```{r hi-lo-table}
+ev %>% filter(date %in% c(hi_day, lo_day)) %>%
+  arrange(date, person, start_local) %>%
+  transmute(Day = format(date, "%a %d %b"), Household = person,
+            Start = format(start_local, "%H:%M"), Stop = format(stop_local, "%H:%M"),
+            `Duration (min)` = round(duration_min),
+            `Peak (°C)` = peak_temp, `Mean (°C)` = round(mean_temp, 1))
+```
+
+## Hottest and coolest individual events
+
+```{r hot-cool}
+bind_rows(
+  ev %>% slice_max(peak_temp, n = 10, with_ties = FALSE) %>% mutate(Rank = "Hottest 10"),
+  ev %>% slice_min(peak_temp, n = 10, with_ties = FALSE) %>% mutate(Rank = "Coolest 10")
+) %>% transmute(Rank, Day = format(date, "%a %d %b"), Household = person,
+                Start = format(start_local, "%H:%M"), Stop = format(stop_local, "%H:%M"),
+                `Duration (min)` = round(duration_min),
+                `Peak (°C)` = peak_temp, `Mean (°C)` = round(mean_temp, 1))
+```
+
+---
+
+# 4. Every day, every event
+
+One plot per day, one row per household, showing the real stove temperature: it rises to a high
+while cooking and falls to a low when it stops. Vertical lines mark each hour (lighter = half-hour).
+
+```{r timeline, fig.height=day_h, fig.width=12}
+for (d in as.list(all_days)) {
+  d <- as_date(d)
+  p <- day_plot(d)
+  print(p)
+  ggsave(file.path(plots_dir, "days", paste0("day_", format(d), ".png")), p,
+         width = 12, height = day_h, dpi = 150)
+  save_by_person(p, paste0("day_", format(d)), 12, 9, "days")
+}
+```
+
+---
+
+# 5. Summary and event log
+
+```{r summary}
+ev %>% group_by(Household = person) %>%
+  summarise(`Total events` = n(),
+            `Days with data` = n_distinct(date),
+            `Events per day` = round(n() / n_distinct(date), 1),
+            `Total cooking (hours)` = round(sum(duration_min) / 60, 1),
+            `Mean duration (min)` = round(mean(duration_min), 1),
+            `Mean peak temp (°C)` = round(mean(peak_temp, na.rm = TRUE), 1),
+            `Highest peak (°C)` = max(peak_temp, na.rm = TRUE),
+            .groups = "drop")
+```
+
+```{r log}
+ev %>% arrange(person, start_local) %>%
+  transmute(Household = person, Day = format(date, "%a %d %b"),
+            Start = format(start_local, "%H:%M"), Stop = format(stop_local, "%H:%M"),
+            `Duration (min)` = round(duration_min),
+            `Start temp (°C)` = start_temp, `Peak (°C)` = peak_temp,
+            `Mean (°C)` = round(mean_temp, 1), `Rise (°C)` = rise)
+```
+
+---
+
+# 6. Saved images
+
+Every plot above was saved as a PNG in the folder below. Multi-panel plots were also split so that
+each household's panel is saved on its own in `by_household/<Household>/` (and `.../days/` for the daily plots).
+
+```{r saved-images}
+files <- list.files(plots_dir, pattern = "\\.png$", recursive = TRUE)
+cat("Folder:", normalizePath(plots_dir), "\n")
+cat("Total PNG files saved:", length(files), "\n\n")
+as.data.frame(table(Folder = dirname(files)))
+```
